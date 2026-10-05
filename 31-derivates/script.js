@@ -577,6 +577,10 @@ const state = {
     panInitMinX: -10.0,
     panInitMaxX:  10.0,
     panInitPaneYBounds: [],
+
+    // Edge-pan (auto-scroll when probe is dragged near canvas edge)
+    edgePanRAF: null,       // rAF handle
+    edgePanVelocity: 0,    // math-units per second; negative = left, positive = right
 };
 
 
@@ -749,11 +753,20 @@ function resizeCanvas() {
 
 window.addEventListener("resize", resizeCanvas);
 
+// Mobile: update canvas hint based on touch support
+window.addEventListener("load", () => {
+    const hint = document.getElementById("canvasHint");
+    if (hint && (navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse)").matches)) {
+        hint.textContent = "drag to move probe · pinch to zoom · two-finger pan";
+    }
+});
+
 function getPaneGeometry(tierIdx) {
     const totalTiers = Math.max(1, state.tierCount);
-    const paddingX = 64;
-    const headerHeight = 28;
-    const bottomPad = 22;
+    const isNarrow   = state.width < 550;
+    const paddingX     = isNarrow ? 42 : 64;
+    const headerHeight = isNarrow ? 34 : 28;   // 2-line header on mobile needs extra room
+    const bottomPad    = isNarrow ? 16 : 22;
 
     const availableH = state.height;
     const paneH = availableH / totalTiers;
@@ -837,19 +850,33 @@ function render() {
         }
 
         // 2. Pane Header & Live Labels
-        ctx.fillStyle = meta.color;
-        ctx.font = "11px 'DM Mono', monospace";
-        ctx.textAlign = "left";
-        ctx.fillText(`[${meta.label}] ${meta.title}`, pane.plotX, pane.topY + 18);
-
         const valAtA = evalTier(k, a);
         const slopeAtA = evalTier(k + 1, a);
+        const valStr   = Number.isFinite(valAtA)   ? valAtA.toFixed(2)   : "undef";
+        const slopeStr = Number.isFinite(slopeAtA) ? (slopeAtA >= 0 ? `+${slopeAtA.toFixed(2)}` : slopeAtA.toFixed(2)) : "undef";
 
-        ctx.textAlign = "right";
-        ctx.fillStyle = "rgba(223, 250, 244, 0.75)";
-        const valStr = Number.isFinite(valAtA) ? valAtA.toFixed(3) : "undef";
-        const slopeStr = Number.isFinite(slopeAtA) ? (slopeAtA >= 0 ? `+${slopeAtA.toFixed(3)}` : slopeAtA.toFixed(3)) : "undef";
-        ctx.fillText(`(a = ${a.toFixed(2)}, y = ${valStr})  ·  tangent slope = ${slopeStr}`, pane.plotX + pane.plotW, pane.topY + 18);
+        const isNarrow = state.width < 550;
+        const headerFontSize = isNarrow ? 9 : 11;
+        ctx.font = `${headerFontSize}px 'DM Mono', monospace`;
+
+        if (isNarrow) {
+            // Compact 2-line layout: tier label left, values below on second line
+            ctx.fillStyle = meta.color;
+            ctx.textAlign = "left";
+            ctx.fillText(`[${meta.label}] ${meta.title}`, pane.plotX, pane.topY + 12);
+
+            ctx.fillStyle = "rgba(223, 250, 244, 0.65)";
+            ctx.fillText(`a=${a.toFixed(2)}  y=${valStr}  m=${slopeStr}`, pane.plotX, pane.topY + 24);
+        } else {
+            // Full single-line layout for wider screens
+            ctx.fillStyle = meta.color;
+            ctx.textAlign = "left";
+            ctx.fillText(`[${meta.label}] ${meta.title}`, pane.plotX, pane.topY + 18);
+
+            ctx.textAlign = "right";
+            ctx.fillStyle = "rgba(223, 250, 244, 0.75)";
+            ctx.fillText(`(a = ${a.toFixed(2)}, y = ${valStr})  ·  slope = ${slopeStr}`, pane.plotX + pane.plotW, pane.topY + 18);
+        }
 
         // 3. Grid & Coordinate Axes
         drawPaneGrid(pane, yMin, yMax);
@@ -1410,17 +1437,23 @@ canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
 // Pointer Events: Left = Probe scrubber, Right/Middle = 2D Pan
 canvas.addEventListener("pointerdown", (e) => {
-    canvas.setPointerCapture(e.pointerId);
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
 
-    if (e.button === 2 || e.button === 1) {
-        // Right or middle click -> 2D Pan
+    const isRightOrMiddle = (e.button === 2 || e.button === 1 || e.buttons === 2 || e.buttons === 4);
+    const isDoubleClick = (e.detail >= 2);
+    const isModifierPan = (e.shiftKey || e.altKey || e.ctrlKey);
+
+    if (isRightOrMiddle || isDoubleClick || isModifierPan) {
+        // Right click, middle click, double-click drag, or Shift/Alt/Ctrl drag -> 2D Pan
+        e.preventDefault();
         state.isPanning = true;
+        state.isDragging = false;
         state.panStartX = e.clientX;
         state.panStartY = e.clientY;
         state.panInitMinX = state.xMin;
         state.panInitMaxX = state.xMax;
         state.panInitPaneYBounds = state.paneYBounds.map(b => ({ ...b }));
-        canvas.style.cursor = "grab";
+        canvas.style.cursor = "grabbing";
         return;
     }
 
@@ -1432,7 +1465,65 @@ canvas.addEventListener("pointerdown", (e) => {
     }
 });
 
+// Edge-pan: continuously scroll when probe drags near edge
+const EDGE_ZONE = 0.10;  // 10% of canvas width triggers edge-pan
+const EDGE_MAX_SPEED = 4; // max math-units per second at very edge
+
+function startEdgePan() {
+    if (state.edgePanRAF !== null) return; // already running
+    let lastTime = performance.now();
+
+    function loop(now) {
+        const dt = Math.min((now - lastTime) / 1000, 0.1); // cap delta to 100ms
+        lastTime = now;
+
+        if (!state.isDragging || state.edgePanVelocity === 0) {
+            state.edgePanRAF = null;
+            return;
+        }
+
+        const shift = state.edgePanVelocity * dt;
+        state.xMin += shift;
+        state.xMax += shift;
+
+        // Shift all pane Y-bounds proportionally so view tracks probe
+        // (no Y-pan during edge-pan; only X scrolls)
+
+        // Clamp probe to stay within view
+        const clamped = Math.max(state.xMin, Math.min(state.xMax, state.probeA + shift));
+        state.prevProbeA = state.probeA;
+        state.probeA = clamped;
+        if (state.drawMode === 'live') {
+            recordTraceCoverage(state.prevProbeA, state.probeA);
+        }
+
+        render();
+        state.edgePanRAF = requestAnimationFrame(loop);
+    }
+
+    state.edgePanRAF = requestAnimationFrame(loop);
+}
+
+function stopEdgePan() {
+    state.edgePanVelocity = 0;
+    if (state.edgePanRAF !== null) {
+        cancelAnimationFrame(state.edgePanRAF);
+        state.edgePanRAF = null;
+    }
+}
+
 canvas.addEventListener("pointermove", (e) => {
+    // Detect mid-drag right-click or modifier pan trigger (useful for trackpads)
+    if ((e.buttons === 2 || e.buttons === 4 || e.shiftKey || e.altKey || e.ctrlKey) && !state.isPanning && !state.isDragging) {
+        state.isPanning = true;
+        state.panStartX = e.clientX;
+        state.panStartY = e.clientY;
+        state.panInitMinX = state.xMin;
+        state.panInitMaxX = state.xMax;
+        state.panInitPaneYBounds = state.paneYBounds.map(b => ({ ...b }));
+        canvas.style.cursor = "grabbing";
+    }
+
     if (state.isPanning) {
         const deltaPxX = e.clientX - state.panStartX;
         const deltaPxY = e.clientY - state.panStartY;
@@ -1442,13 +1533,37 @@ canvas.addEventListener("pointermove", (e) => {
 
     if (!state.isDragging) return;
     const rect = canvas.getBoundingClientRect();
-    const mathX = canvasToMathX(e.clientX - rect.left);
+    const localX = e.clientX - rect.left;
+    const mathX = canvasToMathX(localX);
     setProbePosition(mathX);
+
+    // Edge-pan: compute velocity based on how close to the canvas edge we are
+    const pane = getPaneGeometry(0);
+    const plotLeft  = pane.plotX;
+    const plotRight = pane.plotX + pane.plotW;
+    const edgePx    = pane.plotW * EDGE_ZONE;
+
+    if (localX < plotLeft + edgePx) {
+        // Near left edge: pan left (negative)
+        const depth = 1 - Math.max(0, (localX - plotLeft) / edgePx);
+        const mathSpan = state.xMax - state.xMin;
+        state.edgePanVelocity = -depth * depth * EDGE_MAX_SPEED * mathSpan;
+        startEdgePan();
+    } else if (localX > plotRight - edgePx) {
+        // Near right edge: pan right (positive)
+        const depth = 1 - Math.max(0, (plotRight - localX) / edgePx);
+        const mathSpan = state.xMax - state.xMin;
+        state.edgePanVelocity = depth * depth * EDGE_MAX_SPEED * mathSpan;
+        startEdgePan();
+    } else {
+        stopEdgePan();
+    }
 });
 
 canvas.addEventListener("pointerup", (e) => {
     state.isDragging = false;
     state.isPanning = false;
+    stopEdgePan();
     canvas.style.cursor = "crosshair";
     try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
 });
@@ -1456,6 +1571,7 @@ canvas.addEventListener("pointerup", (e) => {
 canvas.addEventListener("pointercancel", () => {
     state.isDragging = false;
     state.isPanning = false;
+    stopEdgePan();
     canvas.style.cursor = "crosshair";
 });
 
@@ -1664,6 +1780,27 @@ window.addEventListener("keydown", (e) => {
 // ============================================================================
 // 11. INITIALIZATION
 // ============================================================================
+
+// Mobile controls drawer toggle
+const controlsToggle = document.getElementById("controlsToggle");
+const controlsPanel  = document.querySelector(".controls");
+
+if (controlsToggle && controlsPanel) {
+    controlsToggle.addEventListener("click", () => {
+        const isOpen = controlsPanel.classList.toggle("open");
+        controlsToggle.textContent = isOpen ? "✕" : "⚙";
+        controlsToggle.setAttribute("aria-expanded", String(isOpen));
+    });
+
+    // Tapping the backdrop (canvas) while panel is open closes it
+    canvas.addEventListener("pointerdown", () => {
+        if (controlsPanel.classList.contains("open")) {
+            controlsPanel.classList.remove("open");
+            controlsToggle.textContent = "⚙";
+            controlsToggle.setAttribute("aria-expanded", "false");
+        }
+    }, { capture: true });
+}
 
 function init() {
     updateTierChips();

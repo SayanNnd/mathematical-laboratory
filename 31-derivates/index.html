@@ -52,7 +52,11 @@
         <section class="lab">
             <div class="canvas-wrap" id="canvasWrap">
                 <canvas id="canvas"></canvas>
+                <div class="canvas-hint" id="canvasHint">drag to move probe · scroll to zoom · right-drag to pan</div>
             </div>
+
+            <!-- Mobile FAB: only visible at ≤650px -->
+            <button class="controls-toggle" id="controlsToggle" aria-label="Toggle controls">⚙</button>
 
             <aside class="controls">
 
